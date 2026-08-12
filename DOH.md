@@ -162,3 +162,45 @@ curl -s -w 'TCP:%{time_connect}s TLS:%{time_appconnect}s 总:%{time_total}s\n' \
 # 3. 对照验证 CF 整体路由
 curl -s https://www.cloudflare.com/cdn-cgi/trace | grep colo
 ```
+
+---
+
+# 附录：为什么路由到欧洲？（完整根因链）
+
+## 核心问题
+Cloudflare 在亚洲有 57 个 IX 互联点（HKIX、Equinix HK、BBIX HK、BBIX Tokyo、JPNAP 等），为什么本网络出口的流量落到欧洲（FRA/AMS）而不落香港？
+
+## 关键实测：出口国际路径整体绕路
+
+| 目标区域 | 目标 | TCP RTT |
+|---|---|---|
+| 国内 | 腾讯/阿里 DNS | **17-24ms** |
+| **香港** | 天文台/腾讯云香港 | **151-695ms** ⚠️ |
+| 新加坡 | GitHub 亚太节点 | 95-1115ms |
+| 美西 | GitHub 旧金山 | 224-257ms |
+| 欧洲 | CF-FRA / CF-AMS | 151-259ms |
+
+**颠覆性发现**：从该出口到**香港也要 150ms+**（国际出口路径绕路，没有"近的亚洲"）——到亚洲和欧洲的国际 RTT 差距远小于想象。
+
+## 完整解释链
+
+1. **出口拓扑决定一切**：该网络（电信 163 特征）的国际出口对所有境外目的地 ≥150ms，包括地理上最近的香港/新加坡——这是运营商国际骨干路由的质量特征
+2. **BGP 选路结果**：Cloudflare Anycast 在 HK/FRA/AMS/LAX 等多个边缘广播同一前缀；当各候选边缘的路径质量（AS 路径长度/RTT）相近时，路由按当时状态择优——实测 **FRA 9/10 + LAX 1/10**，边缘选择是动态的
+3. **非 CF 策略歧视**：CF 在香港有 HKIX 等 4+ 互联点，中国流量落欧美是**出口侧路由**的结果，不是 CF 拒收亚洲流量
+4. **与 lemndns 无关**：cloudflare.com 自家站点同样落 FRA——所有 CF 托管站点从该出口都慢
+5. **延迟结构**：TCP ~230ms（地理 RTT 硬约束）+ TLS 额外 300-500ms（跨洲丢包重传）→ 总 1-2s
+
+## 最终结论
+
+- **lemdns 慢 ≠ lemdns 差**：是该出口到所有境外目的地（含亚洲）的普遍 RTT 水平（150ms+）
+- **国内 DoH 快**：纯粹因为服务器在国内（20ms），与"服务好坏"无关
+- **真值服务的固有成本**：要"未被污染的真值"就必须找境外 DNS（因为污染发生在国内链路），而境外 DNS 必然 ≥150ms——**这是不可调和的物理矛盾**，lemdns 的 1-2s/查询是其"准确性"的合理定价
+- 实际使用：低频真值查询完全可接受；批量场景应自行缓存
+
+## 复现
+```bash
+# 边缘动态性
+for i in $(seq 10); do curl -s -m 8 https://speed.cloudflare.com/cdn-cgi/trace | grep ^colo; done
+# 出口绕路证据: 香港目标同样慢
+curl -s -o /dev/null -w 'hkg: %{time_connect}s\n' -m 8 https://www.gov.hk/
+```
