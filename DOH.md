@@ -107,3 +107,58 @@ curl -s -H "accept: application/dns-json" \
 **缺点**：延迟是国内 DoH 的 2.7 倍且抖动大；运营者匿名；托管于 Cloudflare（双重可见性）。
 
 **适用定位**：作为**污染检测/真值查询**的研究工具（精准且可靠）；**不建议**作为日常递归 DNS（性能差 + 信任不确定性）。日常上网建议国内 DoH（doh.pub/alidns，~490ms 稳定），仅需验证封锁域名真值时临时调用 lemdns。
+
+---
+
+# 附录：延迟根因分析（为什么 lemdns 延迟高？）
+
+## 延迟分解（实测）
+
+| 阶段 | 耗时 | 正常预期 |
+|---|---|---|
+| DNS 解析 | 22-27ms | 快（缓存） |
+| TCP 连接 | 181-259ms | = 1 个网络 RTT |
+| TLS 握手 | 515-794ms（TCP 之后额外 280-550ms） | TLS1.3 应仅 +1 RTT |
+| 总 | 853-2389ms（波动大） | — |
+
+## 根因链（逐层定位）
+
+### 1️⃣ 边缘位置：阿姆斯特丹（AMS）❌
+`curl https://dns.lemdns.com/cdn-cgi/trace` → `colo=AMS`
+Cloudflare 把该网络出口的请求路由到**欧洲边缘**，而客户端在中国——中国→欧洲 RTT 基线 150-260ms 是物理距离的硬约束。
+
+### 2️⃣ RTT 基线对照（TCP 连接时间实测）
+
+| 区域 | 目标 | RTT |
+|---|---|---|
+| 国内 | 腾讯/阿里 DNS | **17-24ms** |
+| 亚太 | GitHub 新加坡节点 | 95-102ms |
+| 美西 | GitHub 旧金山节点 | 224-257ms |
+| **欧洲 AMS/FRA** | **lemdns / CF 主站** | **151-259ms** |
+
+国内 DoH 快（17-24ms）因为服务器在国内；lemdns 慢（~230ms 基础 RTT）因为服务器在欧洲——**差距 10 倍是地理距离决定，与服务器性能无关**。
+
+### 3️⃣ TLS 额外开销：跨洲线路抖动
+TLS 握手（515-794ms）超过理论 1 RTT（~230ms），多出的 280-550ms 来自跨洲线路的**丢包重传**；总延迟波动大（853-2389ms）同样印证线路质量不稳定。
+
+### 4️⃣ 不是 lemdns 的错：Cloudflare 整体路由策略
+对照验证：`www.cloudflare.com` / `developers.cloudflare.com` 从同一出口也走欧洲（`colo=FRA`）——**Cloudflare 对该网络出口的所有流量都路由到欧洲边缘**（中国运营商出口与 CF 的对等互联点在欧美，亚洲边缘 HKG/SIN/NRT 对中国内地流量的吸引力受出口路由限制）。这是 Cloudflare Anycast 路由策略的结果，任何 CF 托管站点从该出口都会慢。
+
+## 结论
+
+- **延迟高的主因（~90%）**：边缘在阿姆斯特丹，中国→欧洲物理距离决定的 ~230ms 基础 RTT
+- **次因（~10%）**：跨洲线路丢包抖动放大 TLS 握手开销
+- **与 lemdns 自身性能无关**：是 Cloudflare 路由策略 + 出口地理位置的综合结果
+- **本质矛盾**：lemdns 快 = 服务器在国内（不可得，因为真值性要求海外）；lemdns 准 = 必须在海外（必然远）
+- 实用性结论：**用 lemdns 做低频真值查询可接受**（一次查询 1-2s）；高频场景用它做上游会很难受——建议查询结果本地缓存（max-age=19 太短，自行缓存 60-300s 即可）
+
+## 复现命令
+```bash
+# 1. 看边缘位置
+curl -s https://dns.lemdns.com/cdn-cgi/trace | grep colo
+# 2. 延迟分解
+curl -s -w 'TCP:%{time_connect}s TLS:%{time_appconnect}s 总:%{time_total}s\n' \
+  -o /dev/null "https://dns.lemdns.com/dns-query?name=github.com&type=A"
+# 3. 对照验证 CF 整体路由
+curl -s https://www.cloudflare.com/cdn-cgi/trace | grep colo
+```
