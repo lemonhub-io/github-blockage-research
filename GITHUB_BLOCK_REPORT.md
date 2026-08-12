@@ -199,3 +199,56 @@ done
 python3 gh_monitor.py 20 45 gh_monitor.csv   # 20s间隔 45轮
 # 对照实验: kill 监测 → 停3分钟 → 单轮探测对比状态
 ```
+
+---
+
+# 附录 C：IPv6 封锁状况与可达性研究
+
+## 环境 IPv6 能力
+- 无全局 IPv6 地址、无 IPv6 路由表项（仅 link-local）
+- **IPv6 出口经隧道/NAT 可用**（实测 aliyun `2400:3200::1`、baidu `240e:...` 均可达）
+
+## AAAA 解析状况（本地 vs DoH）
+
+| 域名 | 本地 AAAA | DoH 真值 | 判定 |
+|---|---|---|---|
+| gist.github.com | **`2001::1`** | 无 AAAA 记录 | ❌ **污染**（RFC 保留黑洞地址） |
+| raw.githubusercontent.com | `2606:50c0:800x::154` | 同左 | ✅ 正常（Fastly） |
+| avatars / pages.github.com | `2606:50c0:800x::153/154` | 同左 | ✅ 正常 |
+| github.com / api / codeload / objects | 无 | 无 | 纯 IPv4，无 IPv6 |
+
+**关键**：`2001::1` 为 RFC 保留地址（GFW 经典投毒目标），实测不可达——IPv6 DNS 同样存在污染，且**针对 gist 域名**。
+
+## IPv6 连通性分布
+
+| 目标 | TCP 443 | 传输实测 | 判定 |
+|---|---|---|---|
+| `2606:50c0:8001::154` (raw) | ✅ | **200 / 10071B 完整** | ✅ 可用 |
+| `2606:50c0:8002::154` (avatars) | ✅ | 302 | ✅ 可用 |
+| `2606:50c0:8001::153` (pages) | ✅ | **200 / 14446B 完整** | ✅ 可用 |
+| `2606:50c0:8000::154` (raw) | ❌ 超时 | 000 | ⚠️ 路由不可达 |
+| `2606:50c0:8002::153` (pages) | ✅ | 000 | ⚠️ 传输不可达 |
+| `2a0a:a440::/29` 抽样 8 地址 | ❌ 全超时 | — | 未分配实际服务（猜测地址） |
+
+## IPv4 vs IPv6 对照（核心发现）
+
+| 服务 | IPv4 状态（时序监测 21 轮） | IPv6 状态（实测） |
+|---|---|---|
+| raw.githubusercontent.com | 间歇封锁（可用率 61%，窗口 3-5 分钟） | **8001::154 稳定可用**（多轮全 200） |
+| pages.github.com | 稳定可用 | 8001::153 可用 |
+| gist.github.com | 持久封锁 + AAAA/A 双重 DNS 污染 | 无 IPv6 通道（域名无 AAAA，A 被污染） |
+
+**结论**：
+1. **IPv6 是 IPv4 封锁的有效绕行通道**（对 raw/avatars/pages 等 Fastly 服务）——IPv4 封锁窗口内，强制 `-6` 走 `2606:50c0:8001::154` 可稳定获取内容
+2. IPv6 下封锁面明显更小（主要是路由不可达，非主动阻断）
+3. **IPv6 DNS 同样被投毒**（gist AAAA → 2001::1）——DoH 检测对 AAAA 同样必要
+4. github.com 主站无 IPv6（纯 IPv4），IPv6 绕行不适用于主站
+
+## 使用建议
+```bash
+# IPv4 封锁窗口内下载 raw 文件（IPv6 绕行）
+curl -6 --resolve raw.githubusercontent.com:443:[2606:50c0:8001::154] \
+  -m 15 -o file https://raw.githubusercontent.com/<owner>/<repo>/master/<path>
+# git 配置走 IPv6（若支持）
+git config --global http.https://github.com.proxy ""  # 无代理时
+```
